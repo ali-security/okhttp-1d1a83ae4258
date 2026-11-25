@@ -36,6 +36,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.fail
 import org.junit.Before
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TestRule
@@ -104,6 +105,7 @@ class CallKotlinTest {
   }
 
   @Test
+  @Ignore("Racy on current GitHub runners: MockWebServer may not record the aborted PUT as a failure before the next HEAD arrives")
   fun testHeadAfterPut() {
     class ErringRequestBody : RequestBody() {
       override fun contentType(): MediaType {

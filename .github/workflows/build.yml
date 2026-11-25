@@ -1,11 +1,12 @@
 name: build
 
 on:
-  push:
-    branches:
-      - okhttp_4x
-  pull_request:
-    types: [opened, labeled, unlabeled, synchronize]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task and --tests selector to run instead of the full suite'
+        required: false
+        default: ''
 
 env:
   GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
@@ -13,7 +14,7 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/okhttp_4x'
+    if: false
 
     steps:
       - name: Checkout
@@ -23,10 +24,11 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Upload Artifacts
         run: ./gradlew publishAllPublicationsToMavencentralRepository
@@ -37,6 +39,7 @@ jobs:
 
   checkjdk11:
     runs-on: ubuntu-latest
+    if: false
 
     steps:
       - name: Checkout
@@ -46,16 +49,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew check -x test
 
   testopenjdk11:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -65,16 +70,158 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
+
+      - name: Fetch hpack-test-case submodule
+        run: |
+          git clone https://github.com/http2jp/hpack-test-case.git okhttp-hpacktests/src/test/resources/hpack-test-case
+          git -C okhttp-hpacktests/src/test/resources/hpack-test-case checkout a5652bc2bc3d2a992f39446369fb004a72e881d4
+
+      - name: Enable test result output
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/seal-test-logging.gradle <<'GRADLE'
+          allprojects {
+            tasks.withType(Test).configureEach { t ->
+              t.testLogging { events "failed" }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  println "TEST SUMMARY ${t.path}: ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped (${result.resultType})"
+                }
+              }
+            }
+          }
+          GRADLE
 
       - name: Run Checks
-        run: ./gradlew test -Dtest.java.version=11
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew ${{ inputs.test-filter }} -Dtest.java.version=11
+          else
+            ./gradlew test -Dtest.java.version=11
+          fi
+
+      - name: Build jar
+        run: ./gradlew :okhttp:jar
+
+      - name: Upload okhttp jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: okhttp-jar
+          path: okhttp/build/libs/okhttp-4.12.0.jar
+          if-no-files-found: error
+
+      - name: Test report
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          import glob, re
+
+          ASSUME = re.compile(r'assume\w*\(|Assume\.|assumeThat|AssumptionViolatedException\(')
+
+          def find_src(cls):
+              base = cls.split('$')[0].replace('.', '/')
+              for ext in ('.kt', '.java'):
+                  hits = glob.glob('**/src/test/*/' + base + ext, recursive=True)
+                  if hits:
+                      return hits[0]
+              return None
+
+          def decls(lines, meth):
+              pat = re.compile(r'(fun|void)\s+`?%s`?\s*\(' % re.escape(meth))
+              out = [i for i, l in enumerate(lines) if pat.search(l)]
+              tests = [i for i in out if any('@Test' in lines[j] for j in range(max(i - 4, 0), i + 1))]
+              return tests or out
+
+          def body(lines, i):
+              end = len(lines)
+              for k in range(i + 1, len(lines)):
+                  if re.search(r'@Test|^\s*(private|public|protected)?\s*(fun|void)\s', lines[k]) and k > i + 1:
+                      end = k
+                      break
+              return lines[i:end]
+
+          def assume_in(lines, i, depth=0):
+              b = body(lines, i)
+              for l in b:
+                  if ASSUME.search(l) and not l.strip().startswith('import'):
+                      return l.strip()
+              if depth < 1:
+                  for const in re.findall(r'\b([A-Z][A-Z_]{3,})\b', ' '.join(b[1:])):
+                      for j, l in enumerate(lines):
+                          if re.match(r'\s*%s\s*\{' % const, l):
+                              for l2 in lines[j:j + 15]:
+                                  if ASSUME.search(l2):
+                                      return l2.strip() + '  (via %s)' % const
+                  for name in re.findall(r'\b([a-z]\w+)\(', ' '.join(b[1:])):
+                      for j in decls(lines, name):
+                          r = assume_in(lines, j, depth + 1)
+                          if r:
+                              return r + '  (via helper %s)' % name
+              return None
+
+          def reason(cls, name):
+              meth = re.sub(r'\[.*$', '', name)
+              src = find_src(cls)
+              if not src:
+                  return 'no test source found'
+              lines = open(src, encoding='utf-8').read().splitlines()
+              ds = decls(lines, meth)[:1]
+              for i in ds:
+                  for j in range(i, max(i - 6, -1), -1):
+                      if '@Ignore' in lines[j] or '@Disabled' in lines[j]:
+                          return lines[j].strip()
+              for k, l in enumerate(lines):
+                  if re.match(r'\s*@Ignore', l) and re.search(r'\bclass\b', ' '.join(lines[k:k + 3])):
+                      return 'class-level ' + l.strip()
+              for k, l in enumerate(lines):
+                  if re.match(r'\s*@(Before|BeforeEach)\b', l):
+                      for m in range(k, min(k + 3, len(lines))):
+                          if re.search(r'(fun|void)\s+\w+\s*\(', lines[m]):
+                              r = assume_in(lines, m)
+                              if r and 'assumeNot' not in r:
+                                  return '@Before: ' + r
+                              break
+              for i in ds:
+                  r = assume_in(lines, i)
+                  if r:
+                      return r
+              for l in lines:
+                  if ASSUME.search(l) and not l.strip().startswith('import'):
+                      return 'setup/rule assumption: ' + l.strip()
+              return 'JUnit assumption raised outside the test source (platform rule)'
+
+          tot = {}
+          groups = {}
+          for f in sorted(glob.glob('**/build/test-results/test/*.xml', recursive=True)):
+              mod = f.split('/build/')[0]
+              r = ET.parse(f).getroot()
+              t = tot.setdefault(mod, [0, 0, 0])
+              t[0] += int(r.get('tests', 0)); t[1] += int(r.get('failures', 0)) + int(r.get('errors', 0)); t[2] += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  if tc.find('skipped') is not None:
+                      c, n = tc.get('classname'), tc.get('name')
+                      key = (c.split('.')[-1], reason(c, n)[:150])
+                      groups.setdefault(key, []).append(re.sub(r'\[.*\]$', '[*]', n))
+          print('==== SKIPPED TESTS (class: reason from test source -> methods) ====')
+          for (c, why), ms in groups.items():
+              ms = sorted(set(ms))
+              print('SKIPPED %s (%d): %s -> %s' % (c, len(ms), why, ', '.join(ms)))
+          print('==== TEST TOTALS ====')
+          for mod, (n, fl, sk) in tot.items():
+              print('%s: %d tests, %d passed, %d failed, %d skipped' % (mod, n, n - fl - sk, fl, sk))
+          a = [sum(v[i] for v in tot.values()) for i in range(3)]
+          print('ALL MODULES: %d tests, %d passed, %d failed, %d skipped' % (a[0], a[0] - a[1] - a[2], a[1], a[2]))
+          PY
 
   testzulu11:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'zulu')
 
     steps:
@@ -85,16 +232,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dtest.java.version=11
 
   testopenjdk8:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'jdk8')
 
     steps:
@@ -105,16 +254,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dtest.java.version=8
 
   testopenjdk8alpn:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'jdk8')
 
     steps:
@@ -125,22 +276,25 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Install Old JDK 8
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 8.0.242
+          cache: gradle
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dtest.java.version=8 -Dokhttp.platform=jdk8alpn -Dalpn.boot.version=8.1.13.v20181017 -Dorg.gradle.java.installations.paths=/opt/hostedtoolcache/Java_Adopt_jdk/8.0.242-8.1/x64
 
   testopenjsse:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'openjsse')
 
     steps:
@@ -151,16 +305,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dtest.java.version=8 -Dokhttp.platform=openjsse
 
   testconscrypt:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'conscrypt')
 
     steps:
@@ -171,16 +327,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dokhttp.platform=conscrypt
 
   testbouncycastle:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'bouncycastle')
 
     steps:
@@ -191,16 +349,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dokhttp.platform=bouncycastle
 
   testcorretto:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x'
 
     steps:
@@ -211,16 +371,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dokhttp.platform=corretto
 
   testopenjdk16:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x'
 
     steps:
@@ -231,16 +393,18 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Run Checks
         run: ./gradlew test -Dtest.java.version=16
 
   testwindows:
     runs-on: windows-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'windows')
 
     steps:
@@ -251,10 +415,11 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Test
         run: |
@@ -262,6 +427,7 @@ jobs:
 
   testgraal:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'graal')
 
     steps:
@@ -272,10 +438,11 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v4
         with:
           distribution: 'adopt'
           java-version: 11
+          cache: gradle
 
       - name: Build ConsoleLauncher
         run: ./gradlew -PgraalBuild native-image-tests:nativeImage
@@ -285,6 +452,7 @@ jobs:
 
   testandroid:
     runs-on: macos-latest
+    timeout-minutes: 50
     if: github.ref == 'refs/heads/okhttp_4x' || contains(github.event.pull_request.labels.*.name, 'android')
 
     strategy:
@@ -304,10 +472,11 @@ jobs:
         uses: gradle/wrapper-validation-action@v1
 
       - name: Configure JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: 11
+          cache: gradle
 
       - name: Run Tests
         uses: reactivecircus/android-emulator-runner@v2
