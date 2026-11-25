@@ -274,6 +274,12 @@ class CertificatePinner internal constructor(
     }
 
     fun matchesHostname(hostname: String): Boolean {
+      // A hostname may carry a trailing dot for an absolute DNS name -- ConnectPlan derives it
+      // from address.url.host, which explicitly preserves one. A pin's pattern is
+      // developer-authored and never has one, so without this normalization the pin is silently
+      // skipped against the dotted spelling of an otherwise-identical hostname.
+      // OkHostnameVerifier already treats both spellings as equivalent for the same reason.
+      val hostname = if (hostname.endsWith(".")) hostname.dropLast(1) else hostname
       return when {
         pattern.startsWith("**.") -> {
           // With ** empty prefixes match so exclude the dot from regionMatches().
